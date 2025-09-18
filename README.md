@@ -9,6 +9,7 @@ an API that accepts videos and performs edits like merging or frame-by-frame mod
 - Lambda function (with FFmpeg layer attached)
 - API Gateway HTTP API (to trigger Lambda)
 
+```mermaid
 graph TD
     A[User / Client] -->|Upload Video| B[S3 Bucket: uploads/]
     A -->|Trigger Processing| G[API Gateway]
@@ -31,7 +32,7 @@ graph TD
         I[EFS Storage]
         G[API Gateway]
     end
-
+```
 
 ## Deploy (Terraform)
 
