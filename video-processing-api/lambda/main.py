@@ -12,10 +12,15 @@ from urllib.parse import urlparse
 import boto3
 
 s3 = boto3.client("s3")
+try:
+    sqs = boto3.client("sqs")
+except Exception:
+    sqs = None
 
 INPUT_BUCKET = os.getenv("INPUT_BUCKET")
 OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET")
 MOUNT_PATH = os.getenv("MOUNT_PATH", "/mnt/efs")
+QUEUE_URL = os.getenv("QUEUE_URL", "")
 
 
 def _has_ffmpeg() -> str | None:
@@ -32,7 +37,27 @@ def _has_ffmpeg() -> str | None:
 
 
 def _download_video_from_url(url: str, output_path: str) -> None:
-    """Download video from URL to local path"""
+    """Download video from URL to local path.
+    If the URL is an S3 URL, use boto3 (works via VPC S3 Gateway endpoint).
+    Supported S3 URL forms:
+    - https://<bucket>.s3.<region>.amazonaws.com/<key>
+    - https://s3.<region>.amazonaws.com/<bucket>/<key>
+    """
+    parsed = urlparse(url)
+    host = parsed.netloc
+    path = parsed.path.lstrip('/')
+    # Virtual-hosted-style
+    if host.endswith('.amazonaws.com') and '.s3.' in host:
+        bucket = host.split('.s3.')[0]
+        key = path
+        s3.download_file(bucket, key, output_path)
+        return
+    # Path-style
+    if host.startswith('s3.') and '/' in path:
+        bucket, key = path.split('/', 1)
+        s3.download_file(bucket, key, output_path)
+        return
+    # Generic HTTP(S)
     with urllib.request.urlopen(url) as response:
         with open(output_path, 'wb') as f:
             f.write(response.read())
@@ -76,25 +101,23 @@ def _get_job_status(job_id: str):
         return None
 
 
-def _handle_merge_operation(data):
-    """Handle video merging operation with URL inputs"""
+def _handle_merge_operation(data, worker_mode: bool = False):
+    """Handle video merging operation with URL inputs.
+    If worker_mode=True (SQS), do not wrap in API Gateway response objects.
+    """
     video_urls = data.get("video_urls", [])  # List of video URLs
     
     if not video_urls or len(video_urls) < 2:
-        return {
-            "statusCode": 400,
-            "headers": {"content-type": "application/json"},
-            "body": json.dumps({
-                "error": "Merge operation requires at least 2 video URLs",
-                "example": {
-                    "operation": "merge",
-                    "video_urls": [
-                        "https://example.com/video1.mp4",
-                        "https://example.com/video2.mp4"
-                    ]
-                }
-            }),
+        msg = {
+            "error": "Merge operation requires at least 2 video URLs",
+            "example": {
+                "operation": "merge",
+                "video_urls": ["https://example.com/video1.mp4", "https://example.com/video2.mp4"]
+            }
         }
+        if worker_mode:
+            raise ValueError(msg["error"])
+        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps(msg)}
     
     ffmpeg_path = _has_ffmpeg()
     if not ffmpeg_path:
@@ -107,8 +130,8 @@ def _handle_merge_operation(data):
         }
     
     try:
-        # Generate unique job ID for this merge
-        job_id = str(uuid.uuid4())[:8]
+        # Use existing job_id if present (SQS), else generate new
+        job_id = data.get("job_id") or str(uuid.uuid4())[:8]
         
         # Save initial job status
         _save_job_status(job_id, "processing", {
@@ -197,36 +220,36 @@ def _handle_merge_operation(data):
             "download_url": download_url,
             "completed_at": time.time()
         })
-        
-        return {
-            "statusCode": 200,
-            "headers": {"content-type": "application/json"},
-            "body": json.dumps({
-                "success": True,
-                "job_id": job_id,
-                "videos_merged": len(video_urls),
-                "download_url": download_url,
-                "expires_in": "1 hour"
-            }),
-        }
+        if worker_mode:
+            return {"success": True, "job_id": job_id, "videos_merged": len(video_urls), "download_url": download_url}
+        else:
+            return {
+                "statusCode": 200,
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps({
+                    "success": True,
+                    "job_id": job_id,
+                    "videos_merged": len(video_urls),
+                    "download_url": download_url,
+                    "expires_in": "1 hour"
+                }),
+            }
         
     except Exception as e:
         # Update status: failed
         try:
-            _save_job_status(job_id, "failed", {
-                "error": str(e),
-                "failed_at": time.time()
-            })
-        except:
-            pass  # Don't fail if we can't save status
-        
+            # job_id may not exist if failure before assignment
+            jid = locals().get("job_id", data.get("job_id", "unknown"))
+            _save_job_status(jid, "failed", {"error": str(e), "failed_at": time.time()})
+        except Exception:
+            pass
+        if worker_mode:
+            # Reraise to make SQS retry
+            raise
         return {
             "statusCode": 500,
             "headers": {"content-type": "application/json"},
-            "body": json.dumps({
-                "error": f"Merge operation failed: {str(e)}",
-                "operation": "merge"
-            }),
+            "body": json.dumps({"error": f"Merge operation failed: {str(e)}", "operation": "merge"}),
         }
 
 
@@ -299,6 +322,15 @@ def _handle_remux_operation(data):
 
 def handler(event, context):
     try:
+        # SQS trigger
+        if isinstance(event, dict) and isinstance(event.get("Records"), list):
+            for record in event["Records"]:
+                if record.get("eventSource") == "aws:sqs":
+                    payload = json.loads(record.get("body", "{}"))
+                    _handle_merge_operation(payload, worker_mode=True)
+            # Successful processing
+            return {"statusCode": 200, "headers": {"content-type": "application/json"}, "body": json.dumps({"status": "ok"})}
+
         method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
 
         if method == "GET":
@@ -338,6 +370,21 @@ def handler(event, context):
             operation = data.get("operation", "remux")  # "remux" or "merge"
             
             if operation == "merge":
+                # Async enqueue if queue configured
+                if QUEUE_URL and sqs is not None:
+                    job_id = data.get("job_id") or str(uuid.uuid4())[:8]
+                    data["job_id"] = job_id
+                    _save_job_status(job_id, "queued", {"video_urls": data.get("video_urls", []), "enqueued_at": time.time()})
+                    sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(data))
+                    # Build status URL for convenience
+                    domain = event.get("requestContext", {}).get("domainName", "")
+                    status_url = f"https://{domain}/status/{job_id}" if domain else f"/status/{job_id}"
+                    return {
+                        "statusCode": 202,
+                        "headers": {"content-type": "application/json"},
+                        "body": json.dumps({"accepted": True, "job_id": job_id, "status_url": status_url})
+                    }
+                # Fallback to sync
                 return _handle_merge_operation(data)
             else:
                 return _handle_remux_operation(data)

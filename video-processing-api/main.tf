@@ -61,6 +61,39 @@ resource "aws_vpc_endpoint" "s3" {
   tags = { Name = "${var.project}-s3-endpoint" }
 }
 
+# Interface Endpoint Security Group (for VPC endpoints like SQS)
+resource "aws_security_group" "vpc_endpoints" {
+  name        = "${var.project}-vpc-endpoints-sg"
+  description = "Allow HTTPS from Lambda to VPC interface endpoints"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description      = "HTTPS from Lambda SG"
+    from_port        = 443
+    to_port          = 443
+    protocol         = "tcp"
+    security_groups  = [aws_security_group.lambda.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# SQS Interface Endpoint so Lambda in private subnets can reach SQS
+resource "aws_vpc_endpoint" "sqs_interface" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = "com.amazonaws.${data.aws_region.current.name}.sqs"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints.id]
+  private_dns_enabled = true
+  tags = { Name = "${var.project}-sqs-endpoint" }
+}
+
 resource "aws_route_table" "private_a" {
   vpc_id = aws_vpc.main.id
   tags   = { Name = "${var.project}-rt-private-a" }
@@ -211,6 +244,19 @@ resource "aws_iam_role_policy" "s3_access" {
       },
       {
         Effect = "Allow",
+        Action = [
+          "sqs:SendMessage",
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+          "sqs:GetQueueUrl"
+        ],
+        Resource = [
+          aws_sqs_queue.jobs.arn
+        ]
+      },
+      {
+        Effect = "Allow",
         Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
         Resource = "*"
       }
@@ -269,8 +315,25 @@ resource "aws_lambda_function" "processor" {
       INPUT_BUCKET  = aws_s3_bucket.input.bucket
       OUTPUT_BUCKET = aws_s3_bucket.output.bucket
       MOUNT_PATH    = "/mnt/efs"
+      QUEUE_URL     = aws_sqs_queue.jobs.url
     }
   }
+}
+
+# -----------------------------
+# SQS for async processing
+# -----------------------------
+resource "aws_sqs_queue" "jobs" {
+  name                        = "${var.project}-${var.env}-jobs"
+  visibility_timeout_seconds  = 900
+  message_retention_seconds   = 86400
+}
+
+resource "aws_lambda_event_source_mapping" "sqs_trigger" {
+  event_source_arn = aws_sqs_queue.jobs.arn
+  function_name    = aws_lambda_function.processor.arn
+  batch_size       = 1
+  enabled          = true
 }
 
 # -----------------------------
