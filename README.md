@@ -12,28 +12,68 @@ A serverless video processing API that accepts videos and performs edits like me
 - **VPC Endpoints**: S3 Gateway endpoint (for S3 access) and SQS Interface endpoint (for queue access)
 
 ```mermaid
-graph TD
-    A[Client] -->|"POST /process (video_urls)"| G[API Gateway]
-    G -->|"Enqueue job"| Q[SQS Queue]
-    H[Lambda Processor] -->|"Polls"| Q
-    H -->|"Download URLs"| B[S3/HTTP]
-    H -->|"Scratch"| I[EFS]
-    H -->|"Normalize + Merge"| I
-    H -->|"Upload result"| S[S3 Output]
-    H -->|"Write status JSON"| S
-    A -->|"GET /status/{job_id}"| G
-    G -->|"Read status JSON"| S
-    A -->|"Download via presigned URL"| S
+flowchart TD
+    A[Client]
+    G[API Gateway]
+    Q[SQS Queue]
+    L[Lambda Processor]
+    S[S3 Output]
+    E[EFS Scratch]
+
+    A --> G
+    G --> Q
+    Q --> L
+    L --> E
+    L --> S
+    A --> G
+    G --> S
 
     subgraph AWS
-        B[S3 Bucket]
-        H[Lambda Function]
-        I[EFS Storage]
-        G[API Gateway]
+        G
+        Q
+        L
+        S
+        E
     end
 ```
 
 ## Deploy (Terraform)
+
+## ER Diagram
+
+```mermaid
+erDiagram
+    JOB ||--o{ MEDIA_ASSET : includes
+    JOB ||--|| OUTPUT : produces
+    JOB ||--o{ STATUS_EVENT : progresses
+
+    JOB {
+      string job_id PK
+      string status
+      number started_at
+      number completed_at
+    }
+
+    MEDIA_ASSET {
+      string url
+      string type
+      string source  "s3|http"
+      number order_index
+    }
+
+    OUTPUT {
+      string bucket
+      string key
+      string download_url
+      number expires_at
+    }
+
+    STATUS_EVENT {
+      string status  "queued|processing|downloading|merging|completed|failed"
+      string message
+      number timestamp
+    }
+```
 
 ### Prerequisites
 
