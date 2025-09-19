@@ -13,17 +13,17 @@ A serverless video processing API that accepts videos and performs edits like me
 
 ```mermaid
 graph TD
-    A[Client] -->|POST /process (video_urls)| G[API Gateway]
-    G -->|Enqueue job| Q[SQS Queue]
-    H[Lambda Processor] -->|Polls| Q
-    H -->|Download URLs| B[S3/HTTP]
-    H -->|Scratch| I[EFS]
-    H -->|Normalize + Merge| I
-    H -->|Upload result| S[S3 Output]
-    H -->|Write status JSON| S
-    A -->|GET /status/{job_id}| G
-    G -->|Read status JSON| S
-    A -->|Download via presigned URL| S
+    A[Client] -->|"POST /process (video_urls)"| G[API Gateway]
+    G -->|"Enqueue job"| Q[SQS Queue]
+    H[Lambda Processor] -->|"Polls"| Q
+    H -->|"Download URLs"| B[S3/HTTP]
+    H -->|"Scratch"| I[EFS]
+    H -->|"Normalize + Merge"| I
+    H -->|"Upload result"| S[S3 Output]
+    H -->|"Write status JSON"| S
+    A -->|"GET /status/{job_id}"| G
+    G -->|"Read status JSON"| S
+    A -->|"Download via presigned URL"| S
 
     subgraph AWS
         B[S3 Bucket]
