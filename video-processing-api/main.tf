@@ -18,8 +18,9 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
-data "aws_availability_zones" "available" {
-  state = "available"
+# Use hardcoded AZs for eu-north-1 to avoid needing ec2:DescribeAvailabilityZones permission
+locals {
+  availability_zones = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
 }
 
 # -----------------------------
@@ -35,7 +36,7 @@ resource "aws_vpc" "main" {
 resource "aws_subnet" "private_a" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = var.private_subnet_a_cidr
-  availability_zone       = data.aws_availability_zones.available.names[0]
+  availability_zone       = local.availability_zones[0]
   map_public_ip_on_launch = false
   tags = { Name = "${var.project}-private-a" }
 }
@@ -43,7 +44,7 @@ resource "aws_subnet" "private_a" {
 resource "aws_subnet" "private_b" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = var.private_subnet_b_cidr
-  availability_zone       = data.aws_availability_zones.available.names[1]
+  availability_zone       = local.availability_zones[1]
   map_public_ip_on_launch = false
   tags = { Name = "${var.project}-private-b" }
 }
@@ -217,15 +218,13 @@ resource "aws_iam_role_policy" "s3_access" {
   })
 }
 
-# Optional: FFmpeg layer (provide zip path to enable)
-variable "ffmpeg_layer_zip_path" {
-  description = "Local path to a prebuilt ffmpeg Lambda layer zip. If empty, layer is not created."
-  type        = string
-  default     = ""
-}
+# Optional: FFmpeg layer (provide zip path to enable or external ARN)
 
 locals {
-  use_layer = length(var.ffmpeg_layer_zip_path) > 0
+  # Whether a local zip should be used to create a layer
+  use_local_layer_zip = length(var.ffmpeg_layer_zip_path) > 0 && length(var.external_ffmpeg_layer_arn) == 0
+  # The chosen layer ARN (external takes precedence)
+  chosen_ffmpeg_layer_arn = length(var.external_ffmpeg_layer_arn) > 0 ? var.external_ffmpeg_layer_arn : (local.use_local_layer_zip ? aws_lambda_layer_version.ffmpeg[0].arn : "")
 }
 
 data "archive_file" "lambda_zip" {
@@ -235,7 +234,7 @@ data "archive_file" "lambda_zip" {
 }
 
 resource "aws_lambda_layer_version" "ffmpeg" {
-  count               = local.use_layer ? 1 : 0
+  count               = local.use_local_layer_zip ? 1 : 0
   filename            = var.ffmpeg_layer_zip_path
   layer_name          = "${var.project}-ffmpeg"
   compatible_runtimes = ["python3.11", "python3.10"]
@@ -253,7 +252,7 @@ resource "aws_lambda_function" "processor" {
   timeout = 60
   memory_size = 2048
 
-  layers = local.use_layer ? [aws_lambda_layer_version.ffmpeg[0].arn] : []
+  layers = length(local.chosen_ffmpeg_layer_arn) > 0 ? [local.chosen_ffmpeg_layer_arn] : []
 
   vpc_config {
     subnet_ids         = [aws_subnet.private_a.id, aws_subnet.private_b.id]
@@ -289,15 +288,21 @@ resource "aws_apigatewayv2_integration" "lambda" {
   payload_format_version = "2.0"
 }
 
+resource "aws_apigatewayv2_route" "health" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "GET /"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
 resource "aws_apigatewayv2_route" "process" {
   api_id    = aws_apigatewayv2_api.http.id
   route_key = "POST /process"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
-resource "aws_apigatewayv2_route" "health" {
+resource "aws_apigatewayv2_route" "status" {
   api_id    = aws_apigatewayv2_api.http.id
-  route_key = "GET /"
+  route_key = "GET /status/{job_id}"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 

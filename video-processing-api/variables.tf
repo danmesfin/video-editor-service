@@ -4,6 +4,18 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
+variable "ffmpeg_layer_zip_path" {
+  description = "Local path to a prebuilt ffmpeg Lambda layer zip. If empty, layer is not created."
+  type        = string
+  default     = ""
+}
+
+variable "external_ffmpeg_layer_arn" {
+  description = "Optional existing FFmpeg Lambda Layer ARN to attach (e.g., from SAR). If set, zip-based layer creation is skipped."
+  type        = string
+  default     = ""
+}
+
 variable "project" {
   description = "Project name used for resource naming"
   type        = string
