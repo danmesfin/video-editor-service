@@ -13,7 +13,7 @@ A serverless video processing API that accepts videos and performs edits like me
 
 ```mermaid
 graph TD
-    A[Client] -->|POST /process\n(video_urls)| G[API Gateway]
+    A[Client] -->|POST /process (video_urls)| G[API Gateway]
     G -->|Enqueue job| Q[SQS Queue]
     H[Lambda Processor] -->|Polls| Q
     H -->|Download URLs| B[S3/HTTP]
