@@ -72,14 +72,22 @@ def _generate_presigned_url(bucket: str, key: str, expiration: int = 3600) -> st
     )
 
 
-def _save_job_status(job_id: str, status: str, metadata: dict = None):
-    """Save job status to S3 for tracking"""
+def _save_job_status(job_id: str, status: str, metadata: dict | None = None, progress: float | None = None):
+    """Save job status to S3 for tracking. Optionally include progress 0-100."""
     status_data = {
         "job_id": job_id,
         "status": status,
         "timestamp": str(int(time.time())),
         "metadata": metadata or {}
     }
+    if progress is not None:
+        # Clamp and round for readability
+        try:
+            pct = max(0.0, min(100.0, float(progress)))
+        except Exception:
+            pct = None
+        if pct is not None:
+            status_data["progress"] = round(pct, 1)
     status_key = f"jobs/{job_id}/status.json"
     s3.put_object(
         Bucket=OUTPUT_BUCKET,
@@ -138,7 +146,7 @@ def _handle_merge_operation(data, worker_mode: bool = False):
             "video_urls": video_urls,
             "videos_count": len(video_urls),
             "started_at": time.time()
-        })
+        }, progress=5)
         
         tmp_dir = Path(MOUNT_PATH) / f"merge_{job_id}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +155,7 @@ def _handle_merge_operation(data, worker_mode: bool = False):
         _save_job_status(job_id, "downloading", {
             "video_urls": video_urls,
             "videos_count": len(video_urls)
-        })
+        }, progress=10)
         
         # Download all videos from URLs
         input_paths = []
@@ -159,12 +167,19 @@ def _handle_merge_operation(data, worker_mode: bool = False):
             
             _download_video_from_url(url, str(input_path))
             input_paths.append(str(input_path))
+            # Update incremental download progress: 10% -> 40%
+            dl_prog = 10 + (30 * (i + 1) / len(video_urls))
+            _save_job_status(job_id, "downloading", {
+                "video_urls": video_urls,
+                "videos_count": len(video_urls),
+                "downloaded": i + 1
+            }, progress=dl_prog)
         
         # Update status: merging
         _save_job_status(job_id, "merging", {
             "video_urls": video_urls,
             "videos_count": len(video_urls)
-        })
+        }, progress=45)
         
         # Create concat file for FFmpeg
         concat_file = tmp_dir / "concat.txt"
@@ -192,6 +207,13 @@ def _handle_merge_operation(data, worker_mode: bool = False):
             ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
             normalized_paths.append(str(normalized_path))
+            # Update normalization progress: 45% -> 95%
+            norm_prog = 45 + (50 * (i + 1) / len(input_paths))
+            _save_job_status(job_id, "merging", {
+                "video_urls": video_urls,
+                "videos_count": len(video_urls),
+                "normalized": i + 1
+            }, progress=norm_prog)
         
         # Step 2: Create new concat file with normalized videos
         normalized_concat_file = tmp_dir / "normalized_concat.txt"
@@ -205,6 +227,7 @@ def _handle_merge_operation(data, worker_mode: bool = False):
             "-i", str(normalized_concat_file), "-c", "copy",
             str(output_path)
         ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _save_job_status(job_id, "merging", {"stage": "concat"}, progress=98)
         
         # Upload result to S3 with unique key
         output_key = f"merged/{job_id}/output.mp4"
@@ -219,7 +242,7 @@ def _handle_merge_operation(data, worker_mode: bool = False):
             "videos_count": len(video_urls),
             "download_url": download_url,
             "completed_at": time.time()
-        })
+        }, progress=100)
         if worker_mode:
             return {"success": True, "job_id": job_id, "videos_merged": len(video_urls), "download_url": download_url}
         else:
@@ -240,7 +263,7 @@ def _handle_merge_operation(data, worker_mode: bool = False):
         try:
             # job_id may not exist if failure before assignment
             jid = locals().get("job_id", data.get("job_id", "unknown"))
-            _save_job_status(jid, "failed", {"error": str(e), "failed_at": time.time()})
+            _save_job_status(jid, "failed", {"error": str(e), "failed_at": time.time()}, progress=100)
         except Exception:
             pass
         if worker_mode:
@@ -334,6 +357,25 @@ def handler(event, context):
         method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
 
         if method == "GET":
+            # Route GET /status/{job_id} first
+            raw_path = event.get("rawPath", "") or event.get("path", "")
+            if isinstance(raw_path, str) and raw_path.startswith("/status/"):
+                job_id = raw_path.split("/status/")[-1]
+                if job_id:
+                    status_data = _get_job_status(job_id)
+                    if status_data:
+                        return {
+                            "statusCode": 200,
+                            "headers": {"content-type": "application/json"},
+                            "body": json.dumps(status_data),
+                        }
+                    else:
+                        return {
+                            "statusCode": 404,
+                            "headers": {"content-type": "application/json"},
+                            "body": json.dumps({"error": "Job not found"}),
+                        }
+            # Otherwise return health root
             return {
                 "statusCode": 200,
                 "headers": {"content-type": "application/json"},
@@ -389,25 +431,7 @@ def handler(event, context):
             else:
                 return _handle_remux_operation(data)
 
-        # Handle GET /status/{job_id} for job status checking
-        if method == "GET":
-            path = event.get("rawPath", "")
-            if path.startswith("/status/"):
-                job_id = path.split("/status/")[-1]
-                if job_id:
-                    status_data = _get_job_status(job_id)
-                    if status_data:
-                        return {
-                            "statusCode": 200,
-                            "headers": {"content-type": "application/json"},
-                            "body": json.dumps(status_data),
-                        }
-                    else:
-                        return {
-                            "statusCode": 404,
-                            "headers": {"content-type": "application/json"},
-                            "body": json.dumps({"error": "Job not found"}),
-                        }
+        # (status GET handled above before health response)
 
         return {
             "statusCode": 405,
