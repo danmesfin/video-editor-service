@@ -36,6 +36,39 @@ def _has_ffmpeg() -> str | None:
     return None
 
 
+def _has_ffprobe() -> str | None:
+    """Find ffprobe binary alongside ffmpeg layer if available."""
+    candidates = [
+        "/opt/bin/ffprobe",
+        "/opt/ffprobe",
+        "/usr/bin/ffprobe",
+        "/usr/local/bin/ffprobe",
+    ]
+    for p in candidates:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _input_has_audio(input_path: str, ffprobe_path: str | None) -> bool:
+    """Return True if input file has at least one audio stream. If ffprobe is not available, assume True."""
+    if not ffprobe_path:
+        return True
+    try:
+        # If any audio stream exists, ffprobe will print an index
+        proc = subprocess.run(
+            [ffprobe_path, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", input_path],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out = (proc.stdout or b"").decode("utf-8").strip()
+        return len(out) > 0
+    except Exception:
+        # Be permissive if detection fails
+        return True
+
+
 def _download_video_from_url(url: str, output_path: str) -> None:
     """Download video from URL to local path.
     If the URL is an S3 URL, use boto3 (works via VPC S3 Gateway endpoint).
@@ -138,6 +171,7 @@ def _handle_merge_operation(data, worker_mode: bool = False):
         }
     
     try:
+        ffprobe_path = _has_ffprobe()
         # Use existing job_id if present (SQS), else generate new
         job_id = data.get("job_id") or str(uuid.uuid4())[:8]
         
@@ -197,14 +231,31 @@ def _handle_merge_operation(data, worker_mode: bool = False):
             normalized_path = tmp_dir / f"normalized_{i}.mp4"
             
             # Normalize to common specs: 1080p, 30fps, H.264, AAC
-            subprocess.run([
-                ffmpeg_path, "-y", "-i", input_path,
-                "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                "-r", "30", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                str(normalized_path)
-            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # If the input has no audio, add a silent stereo track and use -shortest to match video duration.
+            has_audio = _input_has_audio(str(input_path), ffprobe_path)
+            if has_audio:
+                cmd = [
+                    ffmpeg_path, "-y", "-i", str(input_path),
+                    "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                    "-r", "30", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    str(normalized_path)
+                ]
+            else:
+                # input has no audio -> add silent audio via anullsrc
+                cmd = [
+                    ffmpeg_path, "-y",
+                    "-i", str(input_path),
+                    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                    "-shortest",
+                    "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                    "-r", "30", "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    str(normalized_path)
+                ]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
             normalized_paths.append(str(normalized_path))
             # Update normalization progress: 45% -> 95%

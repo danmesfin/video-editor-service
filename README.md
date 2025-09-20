@@ -149,8 +149,8 @@ curl -s $(terraform output -raw api_endpoint)
 
 **Video Merging** (Primary Use Case):
 ```bash
-# Merge videos from URLs
-curl -X POST $(terraform output -raw api_endpoint)/process \
+# Merge videos from URLs (async)
+curl -s -X POST $(terraform output -raw api_endpoint)/process \
   -H 'content-type: application/json' \
   -d '{
     "operation": "merge",
@@ -161,13 +161,11 @@ curl -X POST $(terraform output -raw api_endpoint)/process \
     ]
   }'
 
-# Response includes job_id and download_url:
+# Response (202 Accepted):
 # {
-#   "success": true,
+#   "accepted": true,
 #   "job_id": "a1b2c3d4",
-#   "videos_merged": 3,
-#   "download_url": "https://s3.../merged-video.mp4?signature=...",
-#   "expires_in": "1 hour"
+#   "status_url": "https://<api>/status/a1b2c3d4"
 # }
 ```
 
@@ -176,12 +174,28 @@ curl -X POST $(terraform output -raw api_endpoint)/process \
 # Check job progress (for frontend polling)
 curl -s $(terraform output -raw api_endpoint)/status/a1b2c3d4
 
-# Possible statuses:
-# - "processing": Job started
-# - "downloading": Downloading videos from URLs
-# - "merging": Running FFmpeg merge
-# - "completed": Merge finished, download_url available
-# - "failed": Error occurred
+# Example response while running:
+# {
+#   "job_id": "a1b2c3d4",
+#   "status": "merging",
+#   "progress": 72.5,
+#   "timestamp": "1695123456",
+#   "metadata": {
+#     "video_urls": ["..."],
+#     "videos_count": 2,
+#     "normalized": 1
+#   }
+# }
+
+# When completed, includes a presigned download_url (valid ~1h):
+# {
+#   "job_id": "a1b2c3d4",
+#   "status": "completed",
+#   "progress": 100,
+#   "metadata": {
+#     "download_url": "https://s3.../merged/a1b2c3d4/output.mp4?..."
+#   }
+# }
 ```
 
 ### Examples
@@ -222,14 +236,6 @@ curl -X POST $(terraform output -raw api_endpoint)/process \
     "output_key": "processed/output.mp4"
   }'
 ```
-
-### Current Deployment
-
-- **Region**: eu-north-1
-- **API Endpoint**: https://ehe5e2scsh.execute-api.eu-north-1.amazonaws.com
-- **Input Bucket**: video-processing-api-input-dev-920631856317-eu-north-1
-- **Output Bucket**: video-processing-api-output-dev-920631856317-eu-north-1
-- **FFmpeg Layer**: arn:aws:lambda:eu-north-1:920631856317:layer:ffmpeg:1
 
 ### API Endpoints
 
