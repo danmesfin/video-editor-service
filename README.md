@@ -1,6 +1,6 @@
 # Video editing service API (AWS Lambda + EFS)
 
-A serverless video processing API that accepts videos and performs edits like merging, remuxing, or frame-by-frame modifications using FFmpeg.
+A serverless video processing API that accepts videos and performs edits like merging, remuxing, or frame-by-frame modifications using FFmpeg (to-do).
 
 ## Architecture
 
@@ -198,44 +198,6 @@ curl -s $(terraform output -raw api_endpoint)/status/a1b2c3d4
 # }
 ```
 
-### Examples
-
-Clone this repo, then use the helper scripts under `examples/`.
-
-- `examples/send_merge_request.sh`
-  - Sends a merge request with provided URLs and prints `job_id` and `status_url`.
-  - Usage:
-    ```bash
-    ./examples/send_merge_request.sh "https://example.com/video1.mp4" "https://example.com/video2.mp4"
-    ```
-
-- `examples/poll_status.sh`
-  - Polls job status until it completes or fails.
-  - Usage:
-    ```bash
-    ./examples/poll_status.sh <job_id>
-    ```
-
-- `examples/download_result.sh`
-  - Fetches the presigned `download_url` from status and downloads the merged file.
-  - Usage:
-    ```bash
-    ./examples/download_result.sh <job_id> [output_file]
-    ```
-
-**Single Video Processing** (Legacy):
-```bash
-# Process single video (remux/copy)
-curl -X POST $(terraform output -raw api_endpoint)/process \
-  -H 'content-type: application/json' \
-  -d '{
-    "operation": "remux",
-    "input_bucket": "'$(terraform output -raw s3_input_bucket)'",
-    "input_key": "video.mp4",
-    "output_bucket": "'$(terraform output -raw s3_output_bucket)'",
-    "output_key": "processed/output.mp4"
-  }'
-```
 
 ### API Endpoints
 
@@ -283,20 +245,11 @@ curl -X POST $(terraform output -raw api_endpoint)/process \
   }
 }
 ```
+---
 
-### Video Processing Features
+## TODO
 
-- **Smart Normalization**: Videos are normalized to 1080p, 30fps, H.264/AAC for seamless merging
-- **Aspect Ratio Preservation**: Automatic padding maintains original video proportions
-- **Quality Control**: Uses CRF 23 for optimal quality/size balance
-- **Fast Processing**: Two-pass approach ensures compatibility without quality loss
-- **Secure Downloads**: Presigned URLs with 1-hour expiration
-- **Job Tracking**: Real-time status updates for frontend integration
-
-### Technical Notes
-
-- **Processing**: Two-pass normalization ensures smooth video playback without freezing
-- **Networking**: Lambda runs in private subnets with S3 Gateway endpoint for efficient access
-- **Storage**: EFS provides shared temp storage mounted at `/mnt/efs` for video processing
-- **Security**: IAM roles follow least-privilege with specific S3 and EFS permissions
-- **Scalability**: Serverless architecture scales automatically with demand
+- [ ] Add support for frame-by-frame modifications
+- [ ] Add support for video cropping
+- [ ] Add support for video rotation
+- [ ] Add support for video trimming
