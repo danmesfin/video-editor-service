@@ -11,6 +11,20 @@ A serverless video processing API that accepts videos and performs edits like me
 - **EFS + Access Point**: Shared scratch storage for FFmpeg normalization and merge
 - **VPC Endpoints**: S3 Gateway endpoint (for S3 access) and SQS Interface endpoint (for queue access)
 
+### Project Structure
+
+```
+video-processing-api/
+ ├─ main.tf              # Infrastructure resources
+ ├─ variables.tf         # Configuration variables
+ ├─ outputs.tf          # Stack outputs
+ ├─ lambda/
+ │   ├─ main.py         # Lambda handler
+ │   └─ requirements.txt # Python dependencies
+ └─ layers/
+     └─ README.md       # Layer setup instructions
+```
+
 ```mermaid
 flowchart TD
     A[Client]
@@ -37,9 +51,7 @@ flowchart TD
     end
 ```
 
-## Deploy (Terraform)
-
-## ER Diagram
+### ER Diagram
 
 ```mermaid
 erDiagram
@@ -74,6 +86,9 @@ erDiagram
       number timestamp
     }
 ```
+---
+
+## Deploy (Terraform)
 
 ### Prerequisites
 
@@ -93,20 +108,6 @@ erDiagram
 2) **FFmpeg Layer**: Choose one option:
    - **Option A (Recommended)**: Use AWS Serverless Application Repository layer
    - **Option B**: Build custom layer with static FFmpeg binary
-
-### Project Structure
-
-```
-video-processing-api/
- ├─ main.tf              # Infrastructure resources
- ├─ variables.tf         # Configuration variables
- ├─ outputs.tf          # Stack outputs
- ├─ lambda/
- │   ├─ main.py         # Lambda handler
- │   └─ requirements.txt # Python dependencies
- └─ layers/
-     └─ README.md       # Layer setup instructions
-```
 
 ### Deployment Steps
 
