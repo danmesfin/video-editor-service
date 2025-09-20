@@ -296,7 +296,7 @@ resource "aws_lambda_function" "processor" {
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
 
   timeout = 900
-  memory_size = 6144
+  memory_size = 3008
 
   layers = length(local.chosen_ffmpeg_layer_arn) > 0 ? [local.chosen_ffmpeg_layer_arn] : []
 
