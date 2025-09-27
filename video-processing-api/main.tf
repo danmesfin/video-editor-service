@@ -115,6 +115,63 @@ resource "aws_route_table_association" "b" {
 }
 
 # -----------------------------
+# Public Subnet + Internet/NAT egress
+# -----------------------------
+resource "aws_subnet" "public_a" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.public_subnet_a_cidr
+  availability_zone       = local.availability_zones[0]
+  map_public_ip_on_launch = true
+  tags = { Name = "${var.project}-public-a" }
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${var.project}-igw" }
+}
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags   = { Name = "${var.project}-nat-eip" }
+}
+
+resource "aws_nat_gateway" "ngw" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public_a.id
+  tags          = { Name = "${var.project}-nat" }
+  depends_on    = [aws_internet_gateway.igw]
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${var.project}-rt-public" }
+}
+
+resource "aws_route" "public_internet" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.igw.id
+}
+
+resource "aws_route_table_association" "public_a" {
+  subnet_id      = aws_subnet.public_a.id
+  route_table_id = aws_route_table.public.id
+}
+
+# Default routes for private subnets via NAT
+resource "aws_route" "private_a_default" {
+  route_table_id         = aws_route_table.private_a.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.ngw.id
+}
+
+resource "aws_route" "private_b_default" {
+  route_table_id         = aws_route_table.private_b.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.ngw.id
+}
+
+# -----------------------------
 # EFS + Security Groups
 # -----------------------------
 resource "aws_security_group" "lambda" {

@@ -1,0 +1,31 @@
+version: "3.8"
+services:
+  localstack:
+    image: localstack/localstack:2.3
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3,sqs
+      - DEBUG=1
+      - AWS_DEFAULT_REGION=eu-north-1
+      - EDGE_PORT=4566
+      - LS_LOG=trace
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./.localstack:/var/lib/localstack"
+      - "./localstack-init:/etc/localstack/init/ready.d"
+
+  api:
+    build:
+      context: .
+      dockerfile: ./local_api/Dockerfile
+    env_file:
+      - ./.env.local
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+      - ./tmp:/mnt/efs
+    depends_on:
+      - localstack

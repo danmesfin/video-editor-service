@@ -45,3 +45,9 @@ variable "private_subnet_b_cidr" {
   type        = string
   default     = "10.0.2.0/24"
 }
+
+variable "public_subnet_a_cidr" {
+  description = "CIDR block for public subnet A (for NAT Gateway)"
+  type        = string
+  default     = "10.0.10.0/24"
+}
