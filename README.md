@@ -105,6 +105,14 @@ erDiagram
    output = json
    ```
 
+#### Local Development Notes
+
+- A lightweight FastAPI wrapper in `local_api/` calls the Lambda `handler()` directly for local testing.
+- LocalStack provides S3 and SQS; endpoints are wired via `S3_ENDPOINT_URL` and `SQS_ENDPOINT_URL`.
+- The local API auto-discovers `QUEUE_URL` (by `QUEUE_NAME`) and rewrites it to `http://localstack:4566` inside the container.
+- Convenience: responses may include `download_url_local` for direct downloads from your host (`http://localhost:4566`).
+- Inputs: public HTTPS URLs work locally; for LocalStack S3 inputs, prefer using public links or add `s3://` support in requests.
+
 2) **FFmpeg Layer**: Choose one option:
    - **Option A (Recommended)**: Use AWS Serverless Application Repository layer
    - **Option B**: Build custom layer with static FFmpeg binary
@@ -207,6 +215,10 @@ curl -s $(terraform output -raw api_endpoint)/status/a1b2c3d4
 | `GET` | `/` | Health check and API documentation |
 | `POST` | `/process` | Merge videos or process single video |
 | `GET` | `/status/{job_id}` | Check job status for frontend polling |
+| `POST` | `/caption` | Add text caption to video |
+| `POST` | `/add-audio` | Add audio track to video |
+| `POST` | `/watermark` | Add watermark to video |
+| `POST` | `/overlay` | Overlay image on video |
 
 ### Request Examples
 

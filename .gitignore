@@ -26,3 +26,7 @@ __pycache__/
 .env.local
 .env
 video-processing-api/.terraform.tfstate.lock.info
+
+# cache
+.localstack
+tmp/*

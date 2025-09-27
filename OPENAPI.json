@@ -1,0 +1,247 @@
+openapi: 3.0.3
+info:
+  title: Video Editing API
+  version: 1.0.0
+  description: >
+    A serverless video editing API (merge, captions, audio, watermark, overlay).
+    Asynchronous job-based processing powered by AWS Lambda, S3, and FFmpeg.
+
+servers:
+  - url: https://api.yourdomain.com/v1
+
+security:
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+
+  schemas:
+    JobBase:
+      type: object
+      properties:
+        jobId:
+          type: string
+          example: job_123456
+        status:
+          type: string
+          enum: [queued, processing, completed, failed]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    OutputSpec:
+      type: object
+      properties:
+        format:
+          type: string
+          example: mp4
+        resolution:
+          type: string
+          example: 1080p
+
+    MergeRequest:
+      type: object
+      required: [operation, inputs, output]
+      properties:
+        operation:
+          type: string
+          enum: [merge]
+        inputs:
+          type: array
+          items:
+            type: object
+            properties:
+              url:
+                type: string
+        output:
+          $ref: '#/components/schemas/OutputSpec'
+
+    CaptionRequest:
+      type: object
+      required: [operation, input, caption, output]
+      properties:
+        operation:
+          type: string
+          enum: [caption]
+        input:
+          type: object
+          properties:
+            url:
+              type: string
+        caption:
+          type: object
+          properties:
+            text: { type: string }
+            font: { type: string }
+            size: { type: integer }
+            color: { type: string, example: "#FFFFFF" }
+            position: { type: string, example: bottom-center }
+        output:
+          $ref: '#/components/schemas/OutputSpec'
+
+    AudioRequest:
+      type: object
+      required: [operation, input, audio, output]
+      properties:
+        operation:
+          type: string
+          enum: [add-audio]
+        input:
+          type: object
+          properties:
+            url: { type: string }
+        audio:
+          type: object
+          properties:
+            url: { type: string }
+            start: { type: number }
+            volume: { type: number, example: 0.8 }
+        output:
+          $ref: '#/components/schemas/OutputSpec'
+
+    WatermarkRequest:
+      type: object
+      required: [operation, input, watermark, output]
+      properties:
+        operation:
+          type: string
+          enum: [watermark]
+        input:
+          type: object
+          properties:
+            url: { type: string }
+        watermark:
+          type: object
+          properties:
+            url: { type: string }
+            position: { type: string, example: top-right }
+            opacity: { type: number }
+            scale: { type: number }
+        output:
+          $ref: '#/components/schemas/OutputSpec'
+
+    OverlayRequest:
+      type: object
+      required: [operation, input, overlay, output]
+      properties:
+        operation:
+          type: string
+          enum: [overlay]
+        input:
+          type: object
+          properties:
+            url: { type: string }
+        overlay:
+          type: object
+          properties:
+            url: { type: string }
+            position:
+              type: object
+              properties:
+                x: { type: integer }
+                y: { type: integer }
+            size:
+              type: object
+              properties:
+                width: { type: integer }
+                height: { type: integer }
+            start: { type: number }
+            duration: { type: number }
+        output:
+          $ref: '#/components/schemas/OutputSpec'
+
+    JobResponse:
+      allOf:
+        - $ref: '#/components/schemas/JobBase'
+        - type: object
+          properties:
+            outputUrl:
+              type: string
+              example: s3://bucket/output/job_123456.mp4
+            error:
+              type: string
+              nullable: true
+
+paths:
+  /jobs:
+    post:
+      summary: Create a new video editing job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/MergeRequest'
+                - $ref: '#/components/schemas/CaptionRequest'
+                - $ref: '#/components/schemas/AudioRequest'
+                - $ref: '#/components/schemas/WatermarkRequest'
+                - $ref: '#/components/schemas/OverlayRequest'
+      responses:
+        '200':
+          description: Job created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobBase'
+
+    get:
+      summary: List jobs
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [queued, processing, completed, failed]
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+      responses:
+        '200':
+          description: List of jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/JobBase'
+                  pagination:
+                    type: object
+                    properties:
+                      page: { type: integer }
+                      limit: { type: integer }
+                      total: { type: integer }
+
+  /jobs/{jobId}:
+    get:
+      summary: Get job status
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job status details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'

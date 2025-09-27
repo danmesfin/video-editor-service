@@ -11,9 +11,13 @@ from urllib.parse import urlparse
 
 import boto3
 
-s3 = boto3.client("s3")
+# Allow endpoint overrides for local testing (e.g., LocalStack)
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
+SQS_ENDPOINT_URL = os.getenv("SQS_ENDPOINT_URL")
+
+s3 = boto3.client("s3", endpoint_url=S3_ENDPOINT_URL) if S3_ENDPOINT_URL else boto3.client("s3")
 try:
-    sqs = boto3.client("sqs")
+    sqs = boto3.client("sqs", endpoint_url=SQS_ENDPOINT_URL) if SQS_ENDPOINT_URL else boto3.client("sqs")
 except Exception:
     sqs = None
 
@@ -70,30 +74,72 @@ def _input_has_audio(input_path: str, ffprobe_path: str | None) -> bool:
 
 
 def _download_video_from_url(url: str, output_path: str) -> None:
-    """Download video from URL to local path.
-    If the URL is an S3 URL, use boto3 (works via VPC S3 Gateway endpoint).
-    Supported S3 URL forms:
-    - https://<bucket>.s3.<region>.amazonaws.com/<key>
-    - https://s3.<region>.amazonaws.com/<bucket>/<key>
+    """Download video from URL to local path with robust handling.
+    - If URL looks like S3, use boto3.
+    - Otherwise, fetch via urllib with a browser-like User-Agent and stream to disk.
+      On failure, fallback to `curl -L --fail --retry 3` if available.
     """
+    # Ensure parent directory exists
+    try:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
     parsed = urlparse(url)
     host = parsed.netloc
     path = parsed.path.lstrip('/')
-    # Virtual-hosted-style
+    # Virtual-hosted-style S3
     if host.endswith('.amazonaws.com') and '.s3.' in host:
         bucket = host.split('.s3.')[0]
         key = path
         s3.download_file(bucket, key, output_path)
         return
-    # Path-style
+    # Path-style S3
     if host.startswith('s3.') and '/' in path:
         bucket, key = path.split('/', 1)
         s3.download_file(bucket, key, output_path)
         return
+
     # Generic HTTP(S)
-    with urllib.request.urlopen(url) as response:
-        with open(output_path, 'wb') as f:
-            f.write(response.read())
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            # Stream to disk in chunks
+            with open(output_path, 'wb') as f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        return
+    except Exception:
+        # Fallback to curl if available (handles redirects and some TLS peculiarities)
+        curl_bin = None
+        for p in ["/usr/bin/curl", "/bin/curl", "/usr/local/bin/curl"]:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                curl_bin = p
+                break
+        if curl_bin:
+            try:
+                subprocess.run(
+                    [curl_bin, "-L", "--fail", "--retry", "3", "--connect-timeout", "20", "-sS", url, "-o", output_path],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                return
+            except Exception as e:
+                raise RuntimeError(f"curl download failed: {e}")
+        # If no curl or still failing, raise a descriptive error
+        raise
 
 
 def _generate_presigned_url(bucket: str, key: str, expiration: int = 3600) -> str:
@@ -142,29 +188,362 @@ def _get_job_status(job_id: str):
         return None
 
 
-def _handle_merge_operation(data, worker_mode: bool = False):
-    """Handle video merging operation with URL inputs.
-    If worker_mode=True (SQS), do not wrap in API Gateway response objects.
-    """
-    video_urls = data.get("video_urls", [])  # List of video URLs
+def _handle_caption_operation(data: dict, worker_mode: bool = False):
+    """Handle adding captions to video"""
+    input_url = data.get("input", {}).get("url")
+    caption_config = data.get("caption", {})
     
-    if not video_urls or len(video_urls) < 2:
-        msg = {
-            "error": "Merge operation requires at least 2 video URLs",
-            "example": {
-                "operation": "merge",
-                "video_urls": ["https://example.com/video1.mp4", "https://example.com/video2.mp4"]
-            }
-        }
+    if not input_url or not caption_config.get("text"):
+        error_msg = "Caption operation requires input.url and caption.text"
         if worker_mode:
-            raise ValueError(msg["error"])
-        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps(msg)}
+            raise ValueError(error_msg)
+        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": error_msg})}
+
+    ffmpeg_path = _has_ffmpeg()
+    if not ffmpeg_path:
+        error_msg = "FFmpeg not available - caption operation requires FFmpeg layer"
+        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": error_msg})}
     
+    try:
+        job_id = data.get("job_id") or str(uuid.uuid4())[:8]
+        _save_job_status(job_id, "processing", {"input_url": input_url, "caption": caption_config}, progress=10)
+        
+        tmp_dir = Path(MOUNT_PATH) / f"caption_{job_id}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Download input
+        input_path = tmp_dir / "input.mp4"
+        _download_video_from_url(input_url, str(input_path))
+        _save_job_status(job_id, "processing", {"stage": "downloaded"}, progress=30)
+        
+        # Apply caption (preserve audio if present; inject silent track if missing)
+        output_path = tmp_dir / "output.mp4"
+        text = caption_config.get("text", "")
+        font_size = caption_config.get("size", 24)
+        color = caption_config.get("color", "white")
+        position = caption_config.get("position", "bottom")
+
+        # Map position to FFmpeg drawtext coordinates
+        # New: support percentage-based x/y in caption.position = {"x": 0-100, "y": 0-100}
+        pos_filter: str
+        if isinstance(position, dict) and "x" in position and "y" in position:
+            try:
+                x_pct = max(0.0, min(100.0, float(position.get("x", 0)))) / 100.0
+                y_pct = max(0.0, min(100.0, float(position.get("y", 0)))) / 100.0
+                # Place text with top-left anchored proportionally, adjusted to stay fully in frame
+                # Using (w-text_w) and (h-text_h) keeps text within bounds and roughly centers at the percentage
+                pos_filter = f"x=(w-text_w)*{x_pct}:y=(h-text_h)*{y_pct}"
+            except Exception:
+                # Fallback to default if parsing fails
+                pos_filter = "x=(w-text_w)/2:y=h-text_h-20"
+        else:
+            # Legacy named positions
+            if position == "bottom":
+                pos_filter = "x=(w-text_w)/2:y=h-text_h-20"
+            elif position == "top":
+                pos_filter = "x=(w-text_w)/2:y=20"
+            elif position == "center":
+                pos_filter = "x=(w-text_w)/2:y=(h-text_h)/2"
+            else:
+                pos_filter = "x=(w-text_w)/2:y=h-text_h-20"  # default bottom
+
+        # Build filter and mapping to keep or add audio
+        has_audio = _input_has_audio(str(input_path), _has_ffprobe())
+        draw = f"drawtext=text='{text}':fontsize={font_size}:fontcolor={color}:{pos_filter}"
+        if has_audio:
+            # Keep original audio, encode video
+            cmd = [
+                ffmpeg_path, "-y",
+                "-i", str(input_path),
+                "-filter_complex", f"[0:v]{draw}[v]",
+                "-map", "[v]", "-map", "0:a",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "copy",
+                str(output_path)
+            ]
+        else:
+            # Inject a silent stereo audio track so output has audio
+            cmd = [
+                ffmpeg_path, "-y",
+                "-i", str(input_path),
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-shortest",
+                "-filter_complex", f"[0:v]{draw}[v]",
+                "-map", "[v]", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                str(output_path)
+            ]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        _save_job_status(job_id, "uploading", {}, progress=80)
+        
+        # Upload result
+        output_key = f"caption/{job_id}/output.mp4"
+        s3.upload_file(str(output_path), OUTPUT_BUCKET, output_key)
+        download_url = _generate_presigned_url(OUTPUT_BUCKET, output_key, 3600)
+        
+        _save_job_status(job_id, "completed", {"download_url": download_url}, progress=100)
+        
+        if worker_mode:
+            return {"success": True, "job_id": job_id, "download_url": download_url}
+        else:
+            return {
+                "statusCode": 200,
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps({"success": True, "job_id": job_id, "download_url": download_url})
+            }
+            
+    except Exception as e:
+        jid = locals().get("job_id", data.get("job_id", "unknown"))
+        _save_job_status(jid, "failed", {"error": str(e)}, progress=100)
+        if worker_mode:
+            raise
+        return {"statusCode": 500, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": f"Caption operation failed: {str(e)}"})}
+
+
+def _handle_audio_operation(data: dict, worker_mode: bool = False):
+    """Handle adding audio overlay to video"""
+    input_url = data.get("input", {}).get("url")
+    audio_config = data.get("audio", {})
+    audio_url = audio_config.get("url")
+    
+    if not input_url or not audio_url:
+        error_msg = "Audio operation requires input.url and audio.url"
+        if worker_mode:
+            raise ValueError(error_msg)
+        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": error_msg})}
+
+    ffmpeg_path = _has_ffmpeg()
+    if not ffmpeg_path:
+        error_msg = "FFmpeg not available - audio operation requires FFmpeg layer"
+        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": error_msg})}
+    
+    try:
+        job_id = data.get("job_id") or str(uuid.uuid4())[:8]
+        _save_job_status(job_id, "processing", {"input_url": input_url, "audio": audio_config}, progress=10)
+        
+        tmp_dir = Path(MOUNT_PATH) / f"audio_{job_id}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Download input video and audio
+        input_path = tmp_dir / "input.mp4"
+        audio_path = tmp_dir / "audio.mp3"
+        _download_video_from_url(input_url, str(input_path))
+        _download_video_from_url(audio_url, str(audio_path))
+        _save_job_status(job_id, "processing", {"stage": "downloaded"}, progress=40)
+        
+        # Apply audio overlay
+        output_path = tmp_dir / "output.mp4"
+        volume = audio_config.get("volume", 1.0)
+        start_time = audio_config.get("start", 0)
+        
+        subprocess.run([
+            ffmpeg_path, "-y", "-i", str(input_path), "-i", str(audio_path),
+            "-filter_complex", f"[1:a]volume={volume}[a1];[0:a][a1]amix=inputs=2:duration=first:dropout_transition=3",
+            "-c:v", "copy", "-ss", str(start_time), str(output_path)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        _save_job_status(job_id, "uploading", {}, progress=80)
+        
+        # Upload result
+        output_key = f"audio/{job_id}/output.mp4"
+        s3.upload_file(str(output_path), OUTPUT_BUCKET, output_key)
+        download_url = _generate_presigned_url(OUTPUT_BUCKET, output_key, 3600)
+        
+        _save_job_status(job_id, "completed", {"download_url": download_url}, progress=100)
+        
+        if worker_mode:
+            return {"success": True, "job_id": job_id, "download_url": download_url}
+        else:
+            return {
+                "statusCode": 200,
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps({"success": True, "job_id": job_id, "download_url": download_url})
+            }
+            
+    except Exception as e:
+        jid = locals().get("job_id", data.get("job_id", "unknown"))
+        _save_job_status(jid, "failed", {"error": str(e)}, progress=100)
+        if worker_mode:
+            raise
+        return {"statusCode": 500, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": f"Audio operation failed: {str(e)}"})}
+
+
+def _handle_watermark_operation(data: dict, worker_mode: bool = False):
+    """Handle adding watermark to video"""
+    input_url = data.get("input", {}).get("url")
+    watermark_config = data.get("watermark", {})
+    watermark_url = watermark_config.get("url")
+    
+    if not input_url or not watermark_url:
+        error_msg = "Watermark operation requires input.url and watermark.url"
+        if worker_mode:
+            raise ValueError(error_msg)
+        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": error_msg})}
+
+    ffmpeg_path = _has_ffmpeg()
+    if not ffmpeg_path:
+        error_msg = "FFmpeg not available - watermark operation requires FFmpeg layer"
+        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": error_msg})}
+    
+    try:
+        job_id = data.get("job_id") or str(uuid.uuid4())[:8]
+        _save_job_status(job_id, "processing", {"input_url": input_url, "watermark": watermark_config}, progress=10)
+        
+        tmp_dir = Path(MOUNT_PATH) / f"watermark_{job_id}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Download input video and watermark
+        input_path = tmp_dir / "input.mp4"
+        watermark_path = tmp_dir / "watermark.png"
+        _download_video_from_url(input_url, str(input_path))
+        _download_video_from_url(watermark_url, str(watermark_path))
+        _save_job_status(job_id, "processing", {"stage": "downloaded"}, progress=40)
+        
+        # Apply watermark
+        output_path = tmp_dir / "output.mp4"
+        position = watermark_config.get("position", "top-right")
+        opacity = watermark_config.get("opacity", 1.0)
+        scale = watermark_config.get("scale", 0.1)
+        
+        # Map position to FFmpeg overlay coordinates
+        if position == "top-left":
+            pos_filter = "10:10"
+        elif position == "top-right":
+            pos_filter = "W-w-10:10"
+        elif position == "bottom-left":
+            pos_filter = "10:H-h-10"
+        elif position == "bottom-right":
+            pos_filter = "W-w-10:H-h-10"
+        else:
+            pos_filter = "W-w-10:10"  # default top-right
+        
+        subprocess.run([
+            ffmpeg_path, "-y", "-i", str(input_path), "-i", str(watermark_path),
+            "-filter_complex", f"[1:v]scale=iw*{scale}:ih*{scale},format=rgba,colorchannelmixer=aa={opacity}[wm];[0:v][wm]overlay={pos_filter}",
+            "-c:a", "copy", str(output_path)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        _save_job_status(job_id, "uploading", {}, progress=80)
+        
+        # Upload result
+        output_key = f"watermark/{job_id}/output.mp4"
+        s3.upload_file(str(output_path), OUTPUT_BUCKET, output_key)
+        download_url = _generate_presigned_url(OUTPUT_BUCKET, output_key, 3600)
+        
+        _save_job_status(job_id, "completed", {"download_url": download_url}, progress=100)
+        
+        if worker_mode:
+            return {"success": True, "job_id": job_id, "download_url": download_url}
+        else:
+            return {
+                "statusCode": 200,
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps({"success": True, "job_id": job_id, "download_url": download_url})
+            }
+            
+    except Exception as e:
+        jid = locals().get("job_id", data.get("job_id", "unknown"))
+        _save_job_status(jid, "failed", {"error": str(e)}, progress=100)
+        if worker_mode:
+            raise
+        return {"statusCode": 500, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": f"Watermark operation failed: {str(e)}"})}
+
+
+def _handle_overlay_operation(data: dict, worker_mode: bool = False):
+    """Handle adding video overlay"""
+    input_url = data.get("input", {}).get("url")
+    overlay_config = data.get("overlay", {})
+    overlay_url = overlay_config.get("url")
+    
+    if not input_url or not overlay_url:
+        error_msg = "Overlay operation requires input.url and overlay.url"
+        if worker_mode:
+            raise ValueError(error_msg)
+        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": error_msg})}
+
+    ffmpeg_path = _has_ffmpeg()
+    if not ffmpeg_path:
+        error_msg = "FFmpeg not available - overlay operation requires FFmpeg layer"
+        return {"statusCode": 400, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": error_msg})}
+    
+    try:
+        job_id = data.get("job_id") or str(uuid.uuid4())[:8]
+        _save_job_status(job_id, "processing", {"input_url": input_url, "overlay": overlay_config}, progress=10)
+        
+        tmp_dir = Path(MOUNT_PATH) / f"overlay_{job_id}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Download input video and overlay
+        input_path = tmp_dir / "input.mp4"
+        overlay_path = tmp_dir / "overlay.mp4"
+        _download_video_from_url(input_url, str(input_path))
+        _download_video_from_url(overlay_url, str(overlay_path))
+        _save_job_status(job_id, "processing", {"stage": "downloaded"}, progress=40)
+        
+        # Apply overlay
+        output_path = tmp_dir / "output.mp4"
+        position = overlay_config.get("position", {})
+        x = position.get("x", 10)
+        y = position.get("y", 10)
+        size = overlay_config.get("size", {})
+        width = size.get("width", 320)
+        height = size.get("height", 240)
+        start_time = overlay_config.get("start", 0)
+        duration = overlay_config.get("duration", 10)
+        
+        subprocess.run([
+            ffmpeg_path, "-y", "-i", str(input_path), "-i", str(overlay_path),
+            "-filter_complex", f"[1:v]scale={width}:{height}[ov];[0:v][ov]overlay={x}:{y}:enable='between(t,{start_time},{start_time + duration})'",
+            "-c:a", "copy", str(output_path)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        _save_job_status(job_id, "uploading", {}, progress=80)
+        
+        # Upload result
+        output_key = f"overlay/{job_id}/output.mp4"
+        s3.upload_file(str(output_path), OUTPUT_BUCKET, output_key)
+        download_url = _generate_presigned_url(OUTPUT_BUCKET, output_key, 3600)
+        
+        _save_job_status(job_id, "completed", {"download_url": download_url}, progress=100)
+        
+        if worker_mode:
+            return {"success": True, "job_id": job_id, "download_url": download_url}
+        else:
+            return {
+                "statusCode": 200,
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps({"success": True, "job_id": job_id, "download_url": download_url})
+            }
+            
+    except Exception as e:
+        jid = locals().get("job_id", data.get("job_id", "unknown"))
+        _save_job_status(jid, "failed", {"error": str(e)}, progress=100)
+        if worker_mode:
+            raise
+        return {"statusCode": 500, "headers": {"content-type": "application/json"}, "body": json.dumps({"error": f"Overlay operation failed: {str(e)}"})}
+
+
+def _handle_merge_operation(data: dict, worker_mode: bool = False):
+    """Handle video merge operation from URLs"""
+    video_urls = data.get("video_urls", [])
+    
+    if len(video_urls) < 2:
+        if worker_mode:
+            raise ValueError("Merge operation requires at least 2 video URLs")
+        return {
+            "statusCode": 400,
+            "headers": {"content-type": "application/json"},
+            "body": json.dumps({"error": "Merge operation requires at least 2 video URLs"}),
+        }
+
     ffmpeg_path = _has_ffmpeg()
     if not ffmpeg_path:
         return {
             "statusCode": 400,
             "headers": {"content-type": "application/json"},
+            "body": json.dumps({"error": "FFmpeg not available - merge operation requires FFmpeg layer"}),
             "body": json.dumps({
                 "error": "FFmpeg not available - merge operation requires FFmpeg layer",
             }),
@@ -401,7 +780,19 @@ def handler(event, context):
             for record in event["Records"]:
                 if record.get("eventSource") == "aws:sqs":
                     payload = json.loads(record.get("body", "{}"))
-                    _handle_merge_operation(payload, worker_mode=True)
+                    operation = payload.get("operation", "merge")
+                    if operation == "merge":
+                        _handle_merge_operation(payload, worker_mode=True)
+                    elif operation == "caption":
+                        _handle_caption_operation(payload, worker_mode=True)
+                    elif operation == "add-audio":
+                        _handle_audio_operation(payload, worker_mode=True)
+                    elif operation == "watermark":
+                        _handle_watermark_operation(payload, worker_mode=True)
+                    elif operation == "overlay":
+                        _handle_overlay_operation(payload, worker_mode=True)
+                    else:
+                        raise ValueError(f"Unknown operation: {operation}")
             # Successful processing
             return {"statusCode": 200, "headers": {"content-type": "application/json"}, "body": json.dumps({"status": "ok"})}
 
@@ -460,14 +851,21 @@ def handler(event, context):
             except Exception:
                 data = event if isinstance(event, dict) else {}
 
-            operation = data.get("operation", "remux")  # "remux" or "merge"
+            operation = data.get("operation", "remux")
             
-            if operation == "merge":
+            # Handle all async operations
+            if operation in ["merge", "caption", "add-audio", "watermark", "overlay"]:
                 # Async enqueue if queue configured
                 if QUEUE_URL and sqs is not None:
                     job_id = data.get("job_id") or str(uuid.uuid4())[:8]
                     data["job_id"] = job_id
-                    _save_job_status(job_id, "queued", {"video_urls": data.get("video_urls", []), "enqueued_at": time.time()})
+                    
+                    # Save initial status based on operation
+                    if operation == "merge":
+                        _save_job_status(job_id, "queued", {"video_urls": data.get("video_urls", []), "enqueued_at": time.time()})
+                    else:
+                        _save_job_status(job_id, "queued", {"input_url": data.get("input", {}).get("url"), "operation": operation, "enqueued_at": time.time()})
+                    
                     sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(data))
                     # Build status URL for convenience
                     domain = event.get("requestContext", {}).get("domainName", "")
@@ -477,9 +875,20 @@ def handler(event, context):
                         "headers": {"content-type": "application/json"},
                         "body": json.dumps({"accepted": True, "job_id": job_id, "status_url": status_url})
                     }
-                # Fallback to sync
-                return _handle_merge_operation(data)
+                
+                # Fallback to sync processing
+                if operation == "merge":
+                    return _handle_merge_operation(data)
+                elif operation == "caption":
+                    return _handle_caption_operation(data)
+                elif operation == "add-audio":
+                    return _handle_audio_operation(data)
+                elif operation == "watermark":
+                    return _handle_watermark_operation(data)
+                elif operation == "overlay":
+                    return _handle_overlay_operation(data)
             else:
+                # Legacy remux operation
                 return _handle_remux_operation(data)
 
         # (status GET handled above before health response)
