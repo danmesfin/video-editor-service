@@ -1,228 +1,122 @@
-# Video editing service API (AWS Lambda + EFS)
+# Video Editing Service API (AWS Lambda + EFS)
 
-A serverless video processing API that accepts videos and performs edits like merging, remuxing, or frame-by-frame modifications using FFmpeg (to-do).
+A serverless video processing API that merges and edits videos using FFmpeg.
 
-## Architecture
+## Key Features
 
-- **API Gateway (HTTP API)**: Public endpoints `/`, `/process`, `/status/{job_id}`
-- **Lambda (Processor)**: Python 3.11 with FFmpeg layer, runs inside VPC
-- **SQS (Jobs Queue)**: Asynchronous job dispatch, Lambda consumes messages
-- **S3 buckets**: Input and output buckets; job status JSON stored under `output-bucket/jobs/<job_id>/status.json`
-- **EFS + Access Point**: Shared scratch storage for FFmpeg normalization and merge
-- **VPC Endpoints**: S3 Gateway endpoint (for S3 access) and SQS Interface endpoint (for queue access)
+- **Merge multiple videos** asynchronously with progress tracking
+- **Caption/text overlay** 
+- **Add audio overlay** 
+- **Image watermark overlay** with configurable position, opacity, and scale
+- **Video overlay** with position, size, start time, and duration
+- **Presigned download URLs** with status persistence in S3
+- **Local development harness** via FastAPI wrapper + LocalStack S3/SQS
 
-### Project Structure
+## Architecture Overview
 
-```
-video-processing-api/
- ├─ main.tf              # Infrastructure resources
- ├─ variables.tf         # Configuration variables
- ├─ outputs.tf          # Stack outputs
- ├─ lambda/
- │   ├─ main.py         # Lambda handler
- │   └─ requirements.txt # Python dependencies
- └─ layers/
-     └─ README.md       # Layer setup instructions
-```
+- **API Gateway (HTTP API)** routes requests to processor Lambda
+- **Lambda (Python 3.11 + FFmpeg)** runs inside VPC with EFS scratch storage
+- **SQS queue** for async job dispatch; Lambda consumes messages
+- **S3 buckets** for inputs, outputs, and job status JSON
+- **EFS** provides shared scratch space during normalization/merge
+- **VPC Endpoints** (S3/SQS) + **NAT Gateway** for internet egress
 
-```mermaid
-flowchart TD
-    A[Client]
-    G[API Gateway]
-    Q[SQS Queue]
-    L[Lambda Processor]
-    S[S3 Output]
-    E[EFS Scratch]
-
-    A --> G
-    G --> Q
-    Q --> L
-    L --> E
-    L --> S
-    A --> G
-    G --> S
-
-    subgraph AWS
-        G
-        Q
-        L
-        S
-        E
-    end
-```
-
-### ER Diagram
-
-```mermaid
-erDiagram
-    JOB ||--o{ MEDIA_ASSET : includes
-    JOB ||--|| OUTPUT : produces
-    JOB ||--o{ STATUS_EVENT : progresses
-
-    JOB {
-      string job_id PK
-      string status
-      number started_at
-      number completed_at
-    }
-
-    MEDIA_ASSET {
-      string url
-      string type
-      string source  "s3|http"
-      number order_index
-    }
-
-    OUTPUT {
-      string bucket
-      string key
-      string download_url
-      number expires_at
-    }
-
-    STATUS_EVENT {
-      string status  "queued|processing|downloading|merging|completed|failed"
-      string message
-      number timestamp
-    }
-```
----
-
-## Deploy (Terraform)
+## Quick Start (Local)
 
 ### Prerequisites
+- Docker and docker-compose
 
-1) **AWS Credentials**: Configure shared profile (recommended):
+### Steps
+1. **Start LocalStack and API**:
    ```bash
-   # Create ~/.aws/credentials
-   [default]
-   aws_access_key_id = YOUR_ACCESS_KEY
-   aws_secret_access_key = YOUR_SECRET_KEY
-   
-   # Create ~/.aws/config  
-   [default]
-   region = eu-north-1
-   output = json
+   cp local.env.example .env.local
+   docker compose up -d localstack
+   docker compose up -d --build api
    ```
 
-#### Local Development Notes
+2. **Health check**:
+   ```bash
+   curl -s http://localhost:8000 | jq
+   ```
 
-- A lightweight FastAPI wrapper in `local_api/` calls the Lambda `handler()` directly for local testing.
-- LocalStack provides S3 and SQS; endpoints are wired via `S3_ENDPOINT_URL` and `SQS_ENDPOINT_URL`.
-- The local API auto-discovers `QUEUE_URL` (by `QUEUE_NAME`) and rewrites it to `http://localstack:4566` inside the container.
-- Convenience: responses may include `download_url_local` for direct downloads from your host (`http://localhost:4566`).
-- Inputs: public HTTPS URLs work locally; for LocalStack S3 inputs, prefer using public links or add `s3://` support in requests.
+3. **Submit a merge job**:
+   ```bash
+   curl -s -X POST http://localhost:8000/process \
+     -H 'content-type: application/json' \
+     -d '{
+       "operation": "merge",
+       "video_urls": [
+         "https://samplelib.com/lib/preview/mp4/sample-5s.mp4",
+         "https://samplelib.com/lib/preview/mp4/sample-10s.mp4"
+       ]
+     }' | jq
+   ```
 
-2) **FFmpeg Layer**: Choose one option:
-   - **Option A (Recommended)**: Use AWS Serverless Application Repository layer
-   - **Option B**: Build custom layer with static FFmpeg binary
+4. **Poll status and download**:
+   ```bash
+   JOB_ID=$(curl -s http://localhost:8000/process -H 'content-type: application/json' -d '{"operation":"merge","video_urls":["https://samplelib.com/lib/preview/mp4/sample-5s.mp4"]}' | jq -r '.job_id // empty')
+   curl -s "http://localhost:8000/status/$JOB_ID" | jq
+   
+   # Download when completed (uses download_url_local for localhost:4566)
+   DL=$(curl -s "http://localhost:8000/status/$JOB_ID" | jq -r '.metadata.download_url_local // .metadata.download_url // empty')
+   [ -n "$DL" ] && curl -L "$DL" -o result.mp4
+   ```
 
-### Deployment Steps
+### Local Development Notes
+- Local API auto-discovers `QUEUE_URL` by `QUEUE_NAME` and rewrites host to `localstack:4566` inside container
+- Responses include `download_url_local` (rewritten to `http://localhost:4566`) for easy host downloads
+- Use public HTTPS URLs for inputs; LocalStack S3 inputs work via public links
 
-1) **Initialize Terraform**:
+## Cloud Deployment
+
+### Prerequisites
+- AWS CLI configured with appropriate permissions
+- Terraform >= 1.5.0
+- FFmpeg layer (external ARN recommended)
+
+### Steps
+
+1. **Initialize Terraform**:
    ```bash
    cd video-processing-api
    terraform init
    ```
 
-2) **Deploy with External FFmpeg Layer** (Recommended):
+2. **Deploy with external FFmpeg layer** (recommended):
    ```bash
-   # Deploy SAR FFmpeg layer first (via AWS Console or CLI)
-   # Then reference the layer ARN:
    terraform apply -auto-approve \
      -var="aws_region=eu-north-1" \
-     -var="external_ffmpeg_layer_arn=arn:aws:lambda:eu-north-1:ACCOUNT:layer:ffmpeg:VERSION"
+     -var="external_ffmpeg_layer_arn=arn:aws:lambda:eu-north-1:920631856317:layer:ffmpeg:1"
    ```
 
-3) **Alternative: Deploy with Custom Layer**:
+3. **Get API endpoint**:
    ```bash
-   # Place ffmpeg binary at layers/bin/ffmpeg, then:
-   cd layers && zip -r ffmpeg-layer.zip bin/ && cd ..
-   terraform apply -auto-approve \
-     -var="aws_region=eu-north-1" \
-     -var="ffmpeg_layer_zip_path=./layers/ffmpeg-layer.zip"
+   API=$(terraform output -raw api_endpoint)
+   echo "API endpoint: $API"
    ```
 
-4) **Deploy without FFmpeg** (S3 copy only):
-   ```bash
-   terraform apply -auto-approve -var="aws_region=eu-north-1"
-   ```
+### Outputs
+- `api_endpoint` - Base URL for API calls
+- `s3_input_bucket` - Input bucket name
+- `s3_output_bucket` - Output bucket name
+- `lambda_name` - Lambda function name for monitoring
 
-### API Usage
+## API Reference
 
-**Health Check**:
-```bash
-curl -s $(terraform output -raw api_endpoint)
-# Expected: {"status":"ok","has_ffmpeg":true,"mount_path_exists":true}
-```
+### Base URL
+Use the `api_endpoint` from Terraform outputs or `http://localhost:8000` for local development.
 
-**Video Merging** (Primary Use Case):
-```bash
-# Merge videos from URLs (async)
-curl -s -X POST $(terraform output -raw api_endpoint)/process \
-  -H 'content-type: application/json' \
-  -d '{
-    "operation": "merge",
-    "video_urls": [
-      "https://example.com/video1.mp4",
-      "https://example.com/video2.mp4",
-      "https://example.com/video3.mp4"
-    ]
-  }'
-
-# Response (202 Accepted):
-# {
-#   "accepted": true,
-#   "job_id": "a1b2c3d4",
-#   "status_url": "https://<api>/status/a1b2c3d4"
-# }
-```
-
-**Job Status Checking**:
-```bash
-# Check job progress (for frontend polling)
-curl -s $(terraform output -raw api_endpoint)/status/a1b2c3d4
-
-# Example response while running:
-# {
-#   "job_id": "a1b2c3d4",
-#   "status": "merging",
-#   "progress": 72.5,
-#   "timestamp": "1695123456",
-#   "metadata": {
-#     "video_urls": ["..."],
-#     "videos_count": 2,
-#     "normalized": 1
-#   }
-# }
-
-# When completed, includes a presigned download_url (valid ~1h):
-# {
-#   "job_id": "a1b2c3d4",
-#   "status": "completed",
-#   "progress": 100,
-#   "metadata": {
-#     "download_url": "https://s3.../merged/a1b2c3d4/output.mp4?..."
-#   }
-# }
-```
-
-
-### API Endpoints
+### Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/` | Health check and API documentation |
-| `POST` | `/process` | Merge videos or process single video |
-| `GET` | `/status/{job_id}` | Check job status for frontend polling |
-| `POST` | `/caption` | Add text caption to video |
-| `POST` | `/add-audio` | Add audio track to video |
-| `POST` | `/watermark` | Add watermark to video |
-| `POST` | `/overlay` | Overlay image on video |
+| `GET` | `/` | Health check and API info |
+| `POST` | `/process` | Submit video processing operation |
+| `GET` | `/status/{job_id}` | Poll job status and get download URL |
 
-### Request Examples
+### Operations
 
-**Merge Multiple Videos**:
+#### Merge Videos
 ```json
 {
   "operation": "merge",
@@ -233,36 +127,137 @@ curl -s $(terraform output -raw api_endpoint)/status/a1b2c3d4
 }
 ```
 
-**Response**:
+#### Add Caption/Text Overlay
 ```json
 {
-  "success": true,
-  "job_id": "a1b2c3d4",
-  "videos_merged": 2,
-  "download_url": "https://s3.amazonaws.com/.../merged-video.mp4?signature=...",
-  "expires_in": "1 hour"
+  "operation": "caption",
+  "input": {"url": "https://example.com/video.mp4"},
+  "caption": {
+    "text": "Hello World!",
+    "size": 36,
+    "color": "white",
+    "position": {"x": 50, "y": 90}
+  }
+}
+```
+**Position options:**
+- String: `"top"`, `"bottom"`, `"center"`
+- Percentage object: `{"x": 0-100, "y": 0-100}` (new feature)
+
+#### Add Audio Overlay
+```json
+{
+  "operation": "add-audio",
+  "input": {"url": "https://example.com/video.mp4"},
+  "audio": {
+    "url": "https://example.com/audio.wav",
+    "volume": 0.8,
+    "start": 0
+  }
 }
 ```
 
-**Job Status Response**:
+#### Add Watermark
+```json
+{
+  "operation": "watermark",
+  "input": {"url": "https://example.com/video.mp4"},
+  "watermark": {
+    "url": "https://example.com/logo.png",
+    "position": "top-right",
+    "opacity": 0.8,
+    "scale": 0.1
+  }
+}
+```
+
+#### Video Overlay
+```json
+{
+  "operation": "overlay",
+  "input": {"url": "https://example.com/main-video.mp4"},
+  "overlay": {
+    "url": "https://example.com/overlay-video.mp4",
+    "position": {"x": 30, "y": 30},
+    "size": {"width": 320, "height": 180},
+    "start": 5,
+    "duration": 10
+  }
+}
+```
+
+### Response Format
+
+#### Async Response (202 Accepted)
+```json
+{
+  "accepted": true,
+  "job_id": "a1b2c3d4",
+  "status_url": "https://api-endpoint/status/a1b2c3d4"
+}
+```
+
+#### Status Response
 ```json
 {
   "job_id": "a1b2c3d4",
   "status": "completed",
+  "progress": 100,
   "timestamp": "1695123456",
   "metadata": {
-    "video_urls": ["https://example.com/video1.mp4", "https://example.com/video2.mp4"],
-    "videos_count": 2,
-    "download_url": "https://s3.amazonaws.com/.../merged-video.mp4",
-    "completed_at": 1695123500
+    "download_url": "https://s3.../output.mp4?...",
+    "download_url_local": "http://localhost:4566/..."
   }
 }
 ```
----
 
-## TODO
+## Behavior & Conventions
 
-- [ ] Add support for frame-by-frame modifications
-- [ ] Add support for video cropping
-- [ ] Add support for video rotation
-- [ ] Add support for video trimming
+### Video Processing
+- **Output format**: H.264/AAC with `yuv420p` pixel format for broad compatibility
+- **Audio handling**: Silent stereo track injected when input lacks audio to maintain stream consistency
+- **Normalization**: Videos normalized to consistent format before merging
+
+### Progress Tracking
+- **Status values**: `queued`, `processing`, `downloading`, `merging`, `uploading`, `completed`, `failed`
+- **Progress**: 0-100 percentage with operation-specific metadata
+- **Persistence**: Status stored as JSON in S3 output bucket under `jobs/{job_id}/status.json`
+
+### Media Compatibility
+- **Supported inputs**: MP4, MOV, AVI, MKV (H.264/H.265 preferred)
+- **Audio formats**: AAC, MP3, WAV
+- **Image formats**: PNG, JPG, GIF (for watermarks)
+
+## Examples
+
+The `examples/` directory contains helper scripts:
+
+- `send_merge_request.sh` - Submit merge job
+- `poll_status.sh` - Poll job status until completion
+- `download_result.sh` - Download completed result
+
+### Usage
+```bash
+cd examples
+./send_merge_request.sh "https://example.com/video1.mp4" "https://example.com/video2.mp4"
+# Returns job_id
+./poll_status.sh "job_id_here"
+./download_result.sh "job_id_here" "output.mp4"
+```
+
+
+## Roadmap
+
+### Planned Features
+- [ ] Video trimming/cutting operations
+- [ ] Frame-by-frame modifications
+- [ ] Video rotation and cropping
+- [ ] Batch processing endpoints
+- [ ] Webhook notifications for job completion
+- [ ] Custom FFmpeg filter support
+
+### Performance Improvements
+- [ ] Parallel processing for merge operations
+- [ ] Smart caching of normalized videos
+- [ ] Lambda memory optimization based on video size
+- [ ] EFS cleanup automation
