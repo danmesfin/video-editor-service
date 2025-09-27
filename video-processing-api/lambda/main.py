@@ -408,16 +408,29 @@ def _handle_watermark_operation(data: dict, worker_mode: bool = False):
         scale = watermark_config.get("scale", 0.1)
         
         # Map position to FFmpeg overlay coordinates
-        if position == "top-left":
-            pos_filter = "10:10"
-        elif position == "top-right":
-            pos_filter = "W-w-10:10"
-        elif position == "bottom-left":
-            pos_filter = "10:H-h-10"
-        elif position == "bottom-right":
-            pos_filter = "W-w-10:H-h-10"
+        # Support either named anchors or percentage-based x/y dict
+        if isinstance(position, dict) and "x" in position and "y" in position:
+            try:
+                x_pct = max(0.0, min(100.0, float(position.get("x", 0)))) / 100.0
+                y_pct = max(0.0, min(100.0, float(position.get("y", 0)))) / 100.0
+                # (W-w) and (H-h) keep the watermark fully within the frame
+                pos_filter = f"(W-w)*{x_pct}:(H-h)*{y_pct}"
+            except Exception:
+                # Fallback to default if parsing fails
+                pos_filter = "W-w-10:10"
         else:
-            pos_filter = "W-w-10:10"  # default top-right
+            if position == "top-left":
+                pos_filter = "10:10"
+            elif position == "top-right":
+                pos_filter = "W-w-10:10"
+            elif position == "bottom-left":
+                pos_filter = "10:H-h-10"
+            elif position == "bottom-right":
+                pos_filter = "W-w-10:H-h-10"
+            elif position == "center":
+                pos_filter = "(W-w)/2:(H-h)/2"
+            else:
+                pos_filter = "W-w-10:10"  # default top-right
         
         subprocess.run([
             ffmpeg_path, "-y", "-i", str(input_path), "-i", str(watermark_path),
@@ -485,8 +498,27 @@ def _handle_overlay_operation(data: dict, worker_mode: bool = False):
         # Apply overlay
         output_path = tmp_dir / "output.mp4"
         position = overlay_config.get("position", {})
-        x = position.get("x", 10)
-        y = position.get("y", 10)
+        # Position may be pixel-based or percentage-based {x:0-100,y:0-100}
+        x_expr = None
+        y_expr = None
+        if isinstance(position, dict) and "x" in position and "y" in position:
+            try:
+                x_val = float(position.get("x", 10))
+                y_val = float(position.get("y", 10))
+                if 0.0 <= x_val <= 100.0 and 0.0 <= y_val <= 100.0:
+                    # Treat as percentage
+                    x_expr = f"(W-w)*{x_val/100.0}"
+                    y_expr = f"(H-h)*{y_val/100.0}"
+                else:
+                    # Treat as absolute pixels
+                    x_expr = str(int(x_val))
+                    y_expr = str(int(y_val))
+            except Exception:
+                x_expr = "10"
+                y_expr = "10"
+        else:
+            x_expr = "10"
+            y_expr = "10"
         size = overlay_config.get("size", {})
         width = size.get("width", 320)
         height = size.get("height", 240)
@@ -495,7 +527,7 @@ def _handle_overlay_operation(data: dict, worker_mode: bool = False):
         
         subprocess.run([
             ffmpeg_path, "-y", "-i", str(input_path), "-i", str(overlay_path),
-            "-filter_complex", f"[1:v]scale={width}:{height}[ov];[0:v][ov]overlay={x}:{y}:enable='between(t,{start_time},{start_time + duration})'",
+            "-filter_complex", f"[1:v]scale={width}:{height}[ov];[0:v][ov]overlay={x_expr}:{y_expr}:enable='between(t,{start_time},{start_time + duration})'",
             "-c:a", "copy", str(output_path)
         ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         

@@ -171,6 +171,20 @@ Use the `api_endpoint` from Terraform outputs or `http://localhost:8000` for loc
 }
 ```
 
+Percent-based positioning is also supported for watermark:
+```json
+{
+  "operation": "watermark",
+  "input": {"url": "https://example.com/video.mp4"},
+  "watermark": {
+    "url": "https://example.com/logo.png",
+    "position": {"x": 85, "y": 5},
+    "opacity": 0.8,
+    "scale": 0.1
+  }
+}
+```
+
 #### Video Overlay
 ```json
 {
@@ -185,6 +199,8 @@ Use the `api_endpoint` from Terraform outputs or `http://localhost:8000` for loc
   }
 }
 ```
+
+Note: For overlay `position`, when `x`/`y` are within 0–100, they are treated as percentages of the available area and positioned as `(W - overlay_w) * x%`, `(H - overlay_h) * y%`. Values outside 0–100 are treated as absolute pixels.
 
 ### Response Format
 
