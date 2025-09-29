@@ -336,13 +336,43 @@ def _handle_audio_operation(data: dict, worker_mode: bool = False):
         # Apply audio overlay
         output_path = tmp_dir / "output.mp4"
         volume = audio_config.get("volume", 1.0)
-        start_time = audio_config.get("start", 0)
-        
-        subprocess.run([
-            ffmpeg_path, "-y", "-i", str(input_path), "-i", str(audio_path),
-            "-filter_complex", f"[1:a]volume={volume}[a1];[0:a][a1]amix=inputs=2:duration=first:dropout_transition=3",
-            "-c:v", "copy", "-ss", str(start_time), str(output_path)
-        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        start_time = float(audio_config.get("start", 0))
+        start_ms = max(0, int(start_time * 1000))
+
+        # Determine if input has audio; if not, we'll inject a silent stereo track
+        has_audio = _input_has_audio(str(input_path), _has_ffprobe())
+
+        if has_audio:
+            # Inputs: 0 = video(with audio), 1 = overlay audio
+            # Delay overlay audio by start_ms, scale volume, then amix
+            filter_complex = f"[1:a]volume={volume},adelay={start_ms}|{start_ms}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3[aout]"
+            cmd = [
+                ffmpeg_path, "-y",
+                "-i", str(input_path),
+                "-i", str(audio_path),
+                "-filter_complex", filter_complex,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+                "-shortest",
+                str(output_path)
+            ]
+        else:
+            # Inject a silent stereo track as base audio
+            # Inputs: 0 = video(no audio), 1 = overlay audio, 2 = generated silence
+            filter_complex = f"[1:a]volume={volume},adelay={start_ms}|{start_ms}[bg];[2:a][bg]amix=inputs=2:duration=first:dropout_transition=3[aout]"
+            cmd = [
+                ffmpeg_path, "-y",
+                "-i", str(input_path),
+                "-i", str(audio_path),
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-filter_complex", filter_complex,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100",
+                "-shortest",
+                str(output_path)
+            ]
+
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         _save_job_status(job_id, "uploading", {}, progress=80)
         
