@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Video Editing Service API Docs (Swagger UI)</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css" />
+    <style>
+      body { margin: 0; padding: 0; }
+      #swagger-ui { box-sizing: border-box; }
+      header { position: fixed; top: 0; left: 0; right: 0; height: 48px; background: #0f172a; color: #fff; display: flex; align-items: center; padding: 0 16px; z-index: 10; }
+      header a { color: #93c5fd; text-decoration: none; margin-left: auto; }
+      #swagger-container { position: absolute; top: 48px; bottom: 0; left: 0; right: 0; overflow: auto; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <a href="./index.html">ReDoc</a>
+    </header>
+    <div id="swagger-container">
+      <div id="swagger-ui"></div>
+    </div>
+    <script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js" crossorigin></script>
+    <script>
+      window.onload = () => {
+        window.ui = SwaggerUIBundle({
+          url: './openapi.yaml',
+          dom_id: '#swagger-ui',
+          deepLinking: true,
+          presets: [SwaggerUIBundle.presets.apis],
+          layout: 'BaseLayout'
+        });
+      };
+    </script>
+  </body>
+</html>
