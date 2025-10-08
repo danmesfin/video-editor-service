@@ -143,12 +143,12 @@ def _download_video_from_url(url: str, output_path: str) -> None:
 
 
 def _generate_presigned_url(bucket: str, key: str, expiration: int = 3600) -> str:
-    """Generate presigned URL for S3 object download"""
-    return s3.generate_presigned_url(
-        'get_object',
-        Params={'Bucket': bucket, 'Key': key},
-        ExpiresIn=expiration
-    )
+    """Generate permanent public S3 URL (bucket must be public).
+    Returns a direct S3 URL that never expires.
+    """
+    region = os.getenv("AWS_REGION", "us-east-1")
+    # Use virtual-hosted-style URL for better browser compatibility
+    return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
 
 
 def _save_job_status(job_id: str, status: str, metadata: dict | None = None, progress: float | None = None):

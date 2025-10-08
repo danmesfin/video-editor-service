@@ -248,10 +248,51 @@ resource "aws_efs_access_point" "ap" {
 # -----------------------------
 resource "aws_s3_bucket" "input" {
   bucket = "${var.project}-input-${var.env}-${data.aws_caller_identity.current.account_id}-${data.aws_region.current.name}"
+  cors_rule {
+    allowed_methods = ["GET", "HEAD"]
+    allowed_origins = ["*"]
+    allowed_headers = ["*"]
+    expose_headers  = ["ETag", "Content-Length", "Content-Type"]
+    max_age_seconds = 86400
+  }
 }
 
 resource "aws_s3_bucket" "output" {
   bucket = "${var.project}-output-${var.env}-${data.aws_caller_identity.current.account_id}-${data.aws_region.current.name}"
+  cors_rule {
+    allowed_methods = ["GET", "HEAD"]
+    allowed_origins = ["*"]
+    allowed_headers = ["*"]
+    expose_headers  = ["ETag", "Content-Length", "Content-Type"]
+    max_age_seconds = 86400
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "output" {
+  bucket = aws_s3_bucket.output.id
+
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+
+resource "aws_s3_bucket_policy" "output_public_read" {
+  bucket = aws_s3_bucket.output.id
+  depends_on = [aws_s3_bucket_public_access_block.output]
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "PublicReadGetObject"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.output.arn}/*"
+      }
+    ]
+  })
 }
 
 # -----------------------------
@@ -373,6 +414,7 @@ resource "aws_lambda_function" "processor" {
       OUTPUT_BUCKET = aws_s3_bucket.output.bucket
       MOUNT_PATH    = "/mnt/efs"
       QUEUE_URL     = aws_sqs_queue.jobs.url
+      AWS_REGION    = data.aws_region.current.name
     }
   }
 }
@@ -399,6 +441,16 @@ resource "aws_lambda_event_source_mapping" "sqs_trigger" {
 resource "aws_apigatewayv2_api" "http" {
   name          = "${var.project}-${var.env}-api"
   protocol_type = "HTTP"
+
+  # Enable CORS for browser clients (React app)
+  cors_configuration {
+    allow_origins     = ["*"]
+    allow_methods     = ["GET", "POST", "OPTIONS"]
+    allow_headers     = ["content-type", "authorization"]
+    expose_headers    = ["content-type"]
+    max_age           = 86400
+    allow_credentials = false
+  }
 }
 
 resource "aws_apigatewayv2_integration" "lambda" {
