@@ -144,6 +144,28 @@ Use the `api_endpoint` from Terraform outputs or `http://localhost:8000` for loc
 - String: `"top"`, `"bottom"`, `"center"`
 - Percentage object: `{"x": 0-100, "y": 0-100}` (new feature)
 
+Notes on caption placement and alignment:
+- The percentage form `{"x": ..., "y": ...}` is relative to the top-left of the video (0% = top/left, 100% = bottom/right).
+- Multi-line text is now centered per line: each line is horizontally centered, and lines are stacked to position the whole block according to `position`.
+- Using `{"x": 50, "y": 50}` places the caption block in the visual center.
+
+**Stroke/outline (new):**
+You can add an outline around the text for "tiktok" styled overlays using `stroke` (alias `outline`).
+
+```json
+{
+  "operation": "caption",
+  "input": {"url": "https://example.com/video.mp4"},
+  "caption": {
+    "text": "Centered with stroke\nsecond line",
+    "size": 56,
+    "color": "white",
+    "position": {"x": 50, "y": 50},
+    "stroke": {"width": 5, "color": "black"}
+  }
+}
+```
+
 #### Add Audio Overlay
 ```json
 {

@@ -249,14 +249,81 @@ def _handle_caption_operation(data: dict, worker_mode: bool = False):
 
         # Build filter and mapping to keep or add audio
         has_audio = _input_has_audio(str(input_path), _has_ffprobe())
-        draw = f"drawtext=text='{text}':fontsize={font_size}:fontcolor={color}:{pos_filter}"
+
+        # Optional text stroke/outline support via FFmpeg drawtext border options
+        stroke_cfg = caption_config.get("stroke") or caption_config.get("outline")
+        stroke_width = 0
+        stroke_color = "black"
+        try:
+            if isinstance(stroke_cfg, dict):
+                stroke_width = int(stroke_cfg.get("width", 0) or 0)
+                stroke_color = str(stroke_cfg.get("color", "black"))
+            elif isinstance(stroke_cfg, (int, float)):
+                stroke_width = int(stroke_cfg)
+            elif stroke_cfg is True:
+                stroke_width = 2
+        except Exception:
+            stroke_width = 0
+
+        # Support true center alignment for multi-line text by drawing each line separately,
+        # centering each line horizontally via (w-text_w)/2 and stacking vertically.
+        def _escape_drawtext(s: str) -> str:
+            # Escape characters significant to drawtext option parsing
+            return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+        lines = str(text).split("\n") if isinstance(text, str) else [str(text)]
+        num_lines = len(lines)
+        line_spacing = int(caption_config.get("line_spacing", 10))
+        line_height = int(font_size) + line_spacing
+        total_height = num_lines * line_height
+
+        # Horizontal position expression per line
+        # Default: center horizontally; if percentage provided, honor it
+        # Named positions -> center horizontally for better readability
+        x_expr = "(w-text_w)/2"
+        y0_expr = "(h-{} )/2".format(total_height)
+
+        # If percentage object provided, place the whole block top at y0 based on total height
+        if isinstance(position, dict) and "x" in position and "y" in position:
+            try:
+                x_pct = max(0.0, min(100.0, float(position.get("x", 0)))) / 100.0
+                y_pct = max(0.0, min(100.0, float(position.get("y", 0)))) / 100.0
+                x_expr = f"(w-text_w)*{x_pct}"
+                y0_expr = f"(h-{total_height})*{y_pct}"
+            except Exception:
+                pass
+        else:
+            # Legacy named positions
+            if position == "top":
+                y0_expr = "20"
+            elif position == "bottom":
+                y0_expr = f"h-{total_height}-20"
+            elif position == "center":
+                y0_expr = f"(h-{total_height})/2"
+
+        # Build chained drawtext filters so each line is truly centered
+        filters: list[str] = []
+        in_label = "0:v"
+        out_label = "v0"
+        for i, line in enumerate(lines):
+            y_expr = f"{y0_expr}+{i}*{line_height}"
+            draw = f"drawtext=text='{_escape_drawtext(line)}':fontsize={font_size}:fontcolor={color}"
+            if stroke_width > 0:
+                draw += f":bordercolor={stroke_color}:borderw={stroke_width}"
+            draw += f":x={x_expr}:y={y_expr}"
+            filters.append(f"[{in_label}]{draw}[{out_label}]")
+            in_label = out_label
+            out_label = f"v{i+1}"
+
+        filter_complex = ";".join(filters)
+
         if has_audio:
             # Keep original audio, encode video
             cmd = [
                 ffmpeg_path, "-y",
                 "-i", str(input_path),
-                "-filter_complex", f"[0:v]{draw}[v]",
-                "-map", "[v]", "-map", "0:a",
+                "-filter_complex", filter_complex,
+                "-map", f"[{in_label}]", "-map", "0:a",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-c:a", "copy",
                 str(output_path)
@@ -268,8 +335,8 @@ def _handle_caption_operation(data: dict, worker_mode: bool = False):
                 "-i", str(input_path),
                 "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                 "-shortest",
-                "-filter_complex", f"[0:v]{draw}[v]",
-                "-map", "[v]", "-map", "1:a",
+                "-filter_complex", filter_complex,
+                "-map", f"[{in_label}]", "-map", "1:a",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
                 str(output_path)
